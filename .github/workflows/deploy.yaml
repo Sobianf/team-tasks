@@ -6,7 +6,7 @@ on:
 
 permissions:
   contents: read
-  packages: write
+  packages: write  # use GITHUB_TOKEN for GHCR
 
 jobs:
   build:
@@ -16,7 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compute image tag (lowercase for GHCR)
+      # Lowercase repo for GHCR image name
+      - name: Compute image tag
         run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> $GITHUB_ENV
 
       - name: Log in to GHCR (GITHUB_TOKEN)
@@ -43,8 +44,6 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
-    env:
-      IMAGE: ${{ needs.build.outputs.image }}
     steps:
       - name: Write SSH key
         run: |
@@ -56,19 +55,22 @@ jobs:
           HOST="${{ secrets.VM_HOST }}"
           USER="${{ secrets.VM_USER }}"
           PORT="${{ secrets.VM_SSH_PORT || 22 }}"
+
+          # Values from this job we need on the remote host
+          IMAGE="${{ needs.build.outputs.image }}"
           ACTOR="${{ github.actor }}"
           TOKEN="${{ secrets.GITHUB_TOKEN }}"
 
-          ssh -o StrictHostKeyChecking=no -i key.pem -p "$PORT" "$USER@$HOST" "bash -s" <<'SH'
+          # Pass vars into remote env, keep heredoc single-quoted
+          ssh -o StrictHostKeyChecking=no -i key.pem -p "$PORT" "$USER@$HOST" \
+            "IMAGE='$IMAGE' ACTOR='$ACTOR' TOKEN='$TOKEN' bash -s" <<'SH'
           set -euxo pipefail
-          IMAGE="${IMAGE}"
 
-          # Login, prep dir
           sudo docker login ghcr.io -u "$ACTOR" -p "$TOKEN"
           sudo mkdir -p /opt/team-tasks
           cd /opt/team-tasks
 
-          # Fresh .env (server + public; no service role key)
+          # Fresh .env (server + public)
           rm -f .env; touch .env
           [ -n '${{ secrets.SUPABASE_URL }}' ] && echo 'SUPABASE_URL=${{ secrets.SUPABASE_URL }}' | sudo tee -a .env >/dev/null || true
           [ -n '${{ secrets.SUPABASE_ANON_KEY }}' ] && echo 'SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}' | sudo tee -a .env >/dev/null || true
@@ -76,20 +78,24 @@ jobs:
           echo 'NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}' | sudo tee -a .env >/dev/null
           echo 'NODE_ENV=production' | sudo tee -a .env >/dev/null
 
-          # Pull & blue/green-lite
+          # Pull image
           sudo docker pull "$IMAGE"
+
+          # Blue/green-lite on 8080
           sudo docker rm -f app_new || true
           sudo docker run -d --name app_new --restart unless-stopped \
             --env-file .env -p 8080:3000 "$IMAGE"
 
+          # Health check
           ok=
           for i in {1..10}; do curl -fsS http://localhost:8080/api/healthz && ok=1 && break || sleep 2; done
           if [ -z "$ok" ]; then echo "Health check failed" >&2; sudo docker logs app_new || true; exit 1; fi
 
-          # Swap to port 80
+          # Free port 80 and swap
           sudo docker rm -f app || true
           sudo docker ps -q --filter "publish=80" | xargs -r sudo docker rm -f
           sudo docker run -d --name app --restart unless-stopped \
             --env-file .env -p 80:3000 "$IMAGE"
 
+          # Clean staging
           sudo docker rm -f app_new || true

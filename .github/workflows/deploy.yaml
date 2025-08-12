@@ -8,14 +8,20 @@ permissions:
   contents: read
   packages: write
 
-env:
-  IMAGE: ghcr.io/${{ toLower(github.repository) }}:${{ github.sha }}
-
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Expose the built image ref to the next job
+    outputs:
+      image: ${{ steps.out.outputs.image }}
     steps:
       - uses: actions/checkout@v4
+
+      # Make a lowercase image name (docker/ghcr require lowercase repo)
+      - name: Compute image tag
+        run: |
+          echo "REPO_LC=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> $GITHUB_ENV
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USER }}" --password-stdin
@@ -26,9 +32,15 @@ jobs:
       - name: Push image
         run: docker push "$IMAGE"
 
+      - id: out
+        name: Export image ref
+        run: echo "image=$IMAGE" >> $GITHUB_OUTPUT
+
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
     steps:
       - name: Write SSH key
         run: |
@@ -36,18 +48,13 @@ jobs:
           chmod 600 key.pem
 
       - name: Deploy on VM
-        env:
-          IMAGE: ${{ env.IMAGE }}
         run: |
           HOST="${{ secrets.VM_HOST }}"
           USER="${{ secrets.VM_USER }}"
           PORT="${{ secrets.VM_SSH_PORT || 22 }}"
 
-          # Run a remote script on the VM
           ssh -o StrictHostKeyChecking=no -i key.pem -p "$PORT" "$USER@$HOST" "bash -s" <<'SH'
           set -euxo pipefail
-
-          # Use the same image tag built in the previous job
           IMAGE="${{ env.IMAGE }}"
 
           # 1) Login to GHCR and prep work dir
@@ -55,15 +62,15 @@ jobs:
           sudo mkdir -p /opt/team-tasks
           cd /opt/team-tasks
 
-          # 2) Write .env from repo secrets (only those provided)
+          # 2) Refresh .env from repo secrets (only those provided)
           rm -f .env
           touch .env
-          [ -n '${{ secrets.SUPABASE_URL }}' ] && echo 'SUPABASE_URL=${{ secrets.SUPABASE_URL }}'       | sudo tee -a .env >/dev/null || true
+          [ -n '${{ secrets.SUPABASE_URL }}' ] && echo 'SUPABASE_URL=${{ secrets.SUPABASE_URL }}' | sudo tee -a .env >/dev/null || true
           [ -n '${{ secrets.SUPABASE_ANON_KEY }}' ] && echo 'SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}' | sudo tee -a .env >/dev/null || true
-          [ -n '${{ secrets.SERVICE_ROLE_KEY }}' ] && echo 'SERVICE_ROLE_KEY=${{ secrets.SERVICE_ROLE_KEY }}'   | sudo tee -a .env >/dev/null || true
+          [ -n '${{ secrets.SERVICE_ROLE_KEY }}' ] && echo 'SERVICE_ROLE_KEY=${{ secrets.SERVICE_ROLE_KEY }}' | sudo tee -a .env >/dev/null || true
           echo 'NODE_ENV=production' | sudo tee -a .env >/dev/null
 
-          # 3) Pull the new image
+          # 3) Pull new image
           sudo docker pull "$IMAGE"
 
           # 4) Blue/green-lite: start on 8080, health-check, then swap to 80
@@ -81,11 +88,9 @@ jobs:
             exit 1
           fi
 
-          # Swap
+          # Swap to port 80 and clean up
           sudo docker rm -f app || true
           sudo docker run -d --name app --restart unless-stopped \
             --env-file .env -p 80:3000 "$IMAGE"
-
-          # Cleanup staging container
           sudo docker rm -f app_new || true
           SH

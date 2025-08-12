@@ -8,9 +8,8 @@ permissions:
   contents: read
   packages: write
 
-# One tag used by both jobs
 env:
-  IMAGE: ghcr.io/${{ github.repository }}:${{ github.sha }}
+  IMAGE: ghcr.io/${{ toLower(github.repository) }}:${{ github.sha }}
 
 jobs:
   build:

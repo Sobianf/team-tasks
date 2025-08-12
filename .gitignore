@@ -1,0 +1,19 @@
+@"
+# Node / Next.js
+node_modules/
+.next/
+dist/
+*.log
+.env*
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+override.tf.json
+*.tfvars
+*.tfvars.json
+# DO commit the lock file for provider checksums
+# (so don't ignore .terraform.lock.hcl)
+"@ | Out-File -Encoding utf8 .gitignore

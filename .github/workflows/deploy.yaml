@@ -1,0 +1,92 @@
+name: Build & Deploy
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# One tag used by both jobs
+env:
+  IMAGE: ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u "${{ secrets.GHCR_USER }}" --password-stdin
+
+      - name: Build image
+        run: docker build -t "$IMAGE" .
+
+      - name: Push image
+        run: docker push "$IMAGE"
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write SSH key
+        run: |
+          echo "${{ secrets.VM_SSH_KEY }}" > key.pem
+          chmod 600 key.pem
+
+      - name: Deploy on VM
+        env:
+          IMAGE: ${{ env.IMAGE }}
+        run: |
+          HOST="${{ secrets.VM_HOST }}"
+          USER="${{ secrets.VM_USER }}"
+          PORT="${{ secrets.VM_SSH_PORT || 22 }}"
+
+          # Run a remote script on the VM
+          ssh -o StrictHostKeyChecking=no -i key.pem -p "$PORT" "$USER@$HOST" "bash -s" <<'SH'
+          set -euxo pipefail
+
+          # Use the same image tag built in the previous job
+          IMAGE="${{ env.IMAGE }}"
+
+          # 1) Login to GHCR and prep work dir
+          sudo docker login ghcr.io -u '${{ secrets.GHCR_USER }}' -p '${{ secrets.GHCR_TOKEN }}'
+          sudo mkdir -p /opt/team-tasks
+          cd /opt/team-tasks
+
+          # 2) Write .env from repo secrets (only those provided)
+          rm -f .env
+          touch .env
+          [ -n '${{ secrets.SUPABASE_URL }}' ] && echo 'SUPABASE_URL=${{ secrets.SUPABASE_URL }}'       | sudo tee -a .env >/dev/null || true
+          [ -n '${{ secrets.SUPABASE_ANON_KEY }}' ] && echo 'SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}' | sudo tee -a .env >/dev/null || true
+          [ -n '${{ secrets.SERVICE_ROLE_KEY }}' ] && echo 'SERVICE_ROLE_KEY=${{ secrets.SERVICE_ROLE_KEY }}'   | sudo tee -a .env >/dev/null || true
+          echo 'NODE_ENV=production' | sudo tee -a .env >/dev/null
+
+          # 3) Pull the new image
+          sudo docker pull "$IMAGE"
+
+          # 4) Blue/green-lite: start on 8080, health-check, then swap to 80
+          sudo docker rm -f app_new || true
+          sudo docker run -d --name app_new --restart unless-stopped \
+            --env-file .env -p 8080:3000 "$IMAGE"
+
+          ok=
+          for i in {1..10}; do
+            curl -fsS http://localhost:8080/api/healthz && ok=1 && break || sleep 2
+          done
+          if [ -z "$ok" ]; then
+            echo "Health check failed" >&2
+            sudo docker logs app_new || true
+            exit 1
+          fi
+
+          # Swap
+          sudo docker rm -f app || true
+          sudo docker run -d --name app --restart unless-stopped \
+            --env-file .env -p 80:3000 "$IMAGE"
+
+          # Cleanup staging container
+          sudo docker rm -f app_new || true
+          SH

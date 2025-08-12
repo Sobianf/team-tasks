@@ -1,16 +1,15 @@
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
+// lib/supabase/client.ts
+'use client';
 
-let client: SupabaseClient | null = null;
+import { createClient } from '@supabase/supabase-js';
 
-export function getSupabase(): SupabaseClient | null {
-  if (client) return client;
+const url  = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-
-  // During Docker build / prerender, these can be missing.
-  if (!url || !anon) return null;
-
-  client = createClient(url, anon);
-  return client;
+if (!url || !anon) {
+  // Helpful console message in dev; avoid silent undefined
+  // You can also throw here if you prefer.
+  console.error('Missing NEXT_PUBLIC_SUPABASE_* envs');
 }
+
+export const supabase = createClient(url ?? '', anon ?? '');
